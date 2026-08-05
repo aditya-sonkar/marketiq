@@ -188,8 +188,7 @@ class TwitterScraper:
             try:
                 driver.get(url)
 
-                if self.check_for_login_wall(driver):
-                    self.save_debug_screenshot(driver, "login_wall", hashtag)
+                if self.save_debug_screenshot(driver, "login_wall", hashtag):
                     logger.warning("[%s] Login wall hit on attempt %d/%d. Retrying in 5s...", hashtag, attempt, retries)
                     time.sleep(random.uniform(5.0, 10.0))
                     continue

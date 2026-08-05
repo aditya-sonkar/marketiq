@@ -65,6 +65,10 @@ class BrowserManager:
         options.add_argument("--disable-popup-blocking")
         options.add_argument("--disable-infobars")
         options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-background-networking")
+        options.add_argument("--disable-features=TranslateUI")
+        options.add_argument("--disable-features=VizDisplayCompositor")
 
         # Exclude automation flags to prevent detection
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -74,14 +78,14 @@ class BrowserManager:
         options.add_argument(f"--window-size={random.choice(self.WINDOW_SIZES)}")
         options.add_argument(f"--user-agent={random.choice(self.USER_AGENTS)}")
 
-        # Configure user data directory for persistent login state
-        if self.settings.user_data_dir:
-            options.add_argument(f"--user-data-dir={self.settings.user_data_dir}")
+        # # Configure user data directory for persistent login state
+        # if self.settings.user_data_dir:
+        #     options.add_argument(f"--user-data-dir={self.settings.user_data_dir}")
 
-            if self.settings.profile_dir:
-                options.add_argument(
-                    f"--profile-directory={self.settings.profile_dir}"
-                )
+        #     if self.settings.profile_dir:
+        #         options.add_argument(
+        #             f"--profile-directory={self.settings.profile_dir}"
+        #         )
 
         options.page_load_strategy = "eager"
         return options
@@ -141,6 +145,7 @@ class BrowserManager:
 
         self._driver = driver
         logger.info("Chrome WebDriver initialized successfully.")
+
         return self._driver
 
     def quit_driver(self) -> None:

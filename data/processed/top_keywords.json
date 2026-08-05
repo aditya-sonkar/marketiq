@@ -1,42 +1,42 @@
 [
     {
-        "keyword": "sensex",
-        "score": 0.30498717461618957
-    },
-    {
-        "keyword": "banknifty",
-        "score": 0.13454278385055707
-    },
-    {
-        "keyword": "intraday",
-        "score": 0.10483241677145952
+        "keyword": "nifty50",
+        "score": 0.2034889901523703
     },
     {
         "keyword": "nifty",
-        "score": 0.10289241482112649
+        "score": 0.13016528078542772
     },
     {
-        "keyword": "nifty50",
-        "score": 0.10289241482112649
+        "keyword": "sensex",
+        "score": 0.10029217149900192
     },
     {
-        "keyword": "nifty showing",
-        "score": 0.08360656605318717
+        "keyword": "market",
+        "score": 0.0750399730216355
     },
     {
-        "keyword": "support 24500",
-        "score": 0.08360656605318717
+        "keyword": "cas",
+        "score": 0.07396993692002536
     },
     {
-        "keyword": "strong",
-        "score": 0.08360656605318717
+        "keyword": "stockmarket",
+        "score": 0.0676912262852445
     },
     {
-        "keyword": "nifty50 intraday",
-        "score": 0.08360656605318717
+        "keyword": "nifty nifty50",
+        "score": 0.06747649811029797
     },
     {
-        "keyword": "option",
-        "score": 0.07492161954371099
+        "keyword": "s",
+        "score": 0.06256962037501777
+    },
+    {
+        "keyword": "stockmarketindia",
+        "score": 0.06160267513893998
+    },
+    {
+        "keyword": "trading",
+        "score": 0.05836067277822117
     }
 ]
