@@ -1,0 +1,11 @@
+{
+    "total_tweets": 100,
+    "mean_signal": 2.5854,
+    "std_dev": 4.9736,
+    "ci_95_lower": 1.6106,
+    "ci_95_upper": 3.5602,
+    "signal_label": "BUY",
+    "confidence_score": 51.98,
+    "bullish_percentage": 63.0,
+    "bearish_percentage": 21.0
+}
