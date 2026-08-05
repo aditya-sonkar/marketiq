@@ -53,6 +53,7 @@ class Settings:
     max_workers: int = 4
     max_retries: int = 3
     no_progress_limit: int = 8
+    cutoff_hours: int = 24
     auth_timeout: int = 1800
     screenshot_retention_days: int = 7
     retry_base_delay: float = 2.0
@@ -181,6 +182,7 @@ def load_settings_from_env() -> Settings:
         max_workers=int(os.getenv("MAX_WORKERS", "4")),
         max_retries=int(os.getenv("MAX_RETRIES", "3")),
         no_progress_limit=int(os.getenv("NO_PROGRESS_LIMIT", "8")),
+        cutoff_hours=int(os.getenv("CUTOFF_HOURS", "168")),
         auth_timeout=int(os.getenv("AUTH_TIMEOUT", "1800")),
         screenshot_retention_days=int(os.getenv("SCREENSHOT_RETENTION_DAYS", "7")),
         retry_base_delay=float(os.getenv("RETRY_BASE_DELAY", "2.0")),

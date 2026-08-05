@@ -118,6 +118,7 @@ class TwitterScraper:
         By.CSS_SELECTOR,
         '[data-testid="loginButton"], a[href*="/login"], a[href="/i/flow/login"], [data-testid="sheetDialog"]',
     )
+    SPINNER_LOCATOR = (By.CSS_SELECTOR, '[data-testid="spinner"], [role="progressbar"]')
     RATE_LIMIT_PHRASES = (
         "rate limit exceeded",
         "something went wrong",
@@ -198,6 +199,13 @@ class TwitterScraper:
         except Exception as e:
             logger.debug("Error checking authentication status: %s", e)
         return False
+
+    def is_loading_spinner_visible(self, driver: WebDriver) -> bool:
+        """Check if X/Twitter network loading spinner is actively visible on DOM."""
+        try:
+            return len(driver.find_elements(*self.SPINNER_LOCATOR)) > 0
+        except Exception:
+            return False
 
     def wait_for_authentication(self, driver: WebDriver, hashtag: str, timeout: Optional[int] = None) -> bool:
         """Poll browser state using WebDriverWait until user completes authentication in Chrome.
@@ -503,7 +511,7 @@ class TwitterScraper:
                 if not self.search_hashtag(driver, hashtag):
                     return collected
 
-                cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
+                cutoff_time = datetime.now(timezone.utc) - timedelta(hours=self.settings.cutoff_hours)
                 scroll_count = 0
                 consecutive_no_growth = 0
                 seen_status_ids: set[str] = set()
@@ -538,6 +546,11 @@ class TwitterScraper:
                                 logger.warning("[%s] Authentication wait failed or timed out.", hashtag)
                                 break
                             consecutive_no_growth = 0
+                            continue
+
+                        if self.is_loading_spinner_visible(driver):
+                            logger.debug("[%s] Network spinner active. Pausing for X/Twitter payload...", hashtag)
+                            time.sleep(2.0)
                             continue
 
                         consecutive_no_growth += 1

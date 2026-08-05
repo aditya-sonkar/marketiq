@@ -1,6 +1,7 @@
 """Browser automation manager for handling Selenium WebDriver lifecycles."""
 
 import random
+from pathlib import Path
 from types import TracebackType
 from typing import Optional, Type
 from selenium import webdriver
@@ -38,8 +39,11 @@ class BrowserManager:
         self.settings = settings or default_settings
         self._driver: Optional[webdriver.Chrome] = None
 
-    def build_options(self) -> Options:
+    def build_options(self, include_user_profile: bool = True) -> Options:
         """Build standard Chrome Options according to configuration settings.
+
+        Args:
+            include_user_profile (bool): Whether to include user data profile arguments.
 
         Returns:
             Options: Configured Selenium Chrome Options instance.
@@ -49,7 +53,7 @@ class BrowserManager:
         if self.settings.headless:
             options.add_argument("--headless=new")
 
-        # Stealth and stability flags
+        # Stealth, background execution, and stability flags
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
@@ -59,9 +63,12 @@ class BrowserManager:
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--disable-extensions")
         options.add_argument("--disable-background-networking")
+        options.add_argument("--disable-background-timer-throttling")
+        options.add_argument("--disable-backgrounding-occluded-windows")
+        options.add_argument("--disable-renderer-backgrounding")
         options.add_argument("--disable-features=TranslateUI")
-        options.add_argument("--disable-features=VizDisplayCompositor")
-        options.add_argument("--remote-debugging-port=0")
+        options.add_argument("--disable-features=VizDisplayCompositor,CalculateNativeWinOcclusion")
+        options.add_argument("--remote-allow-origins=*")
 
         # Exclude automation flags to prevent detection
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -71,8 +78,10 @@ class BrowserManager:
         options.add_argument(f"--window-size={random.choice(self.WINDOW_SIZES)}")
 
         # Configure user data directory for persistent login state
-        if self.settings.user_data_dir:
-            options.add_argument(f"--user-data-dir={self.settings.user_data_dir}")
+        if include_user_profile and self.settings.user_data_dir:
+            user_data_path = Path(self.settings.user_data_dir).resolve()
+            user_data_path.mkdir(parents=True, exist_ok=True)
+            options.add_argument(f"--user-data-dir={user_data_path}")
 
             if self.settings.profile_dir:
                 options.add_argument(
@@ -105,17 +114,25 @@ class BrowserManager:
         try:
             # Use native Selenium 4.10+ Selenium Manager for driver resolution
             driver = webdriver.Chrome(options=options)
-            
         except Exception as e:
             logger.warning("Native Selenium Manager driver creation failed: %s. Attempting ChromeDriverManager fallback...", e)
             try:
                 service = Service(ChromeDriverManager().install())
                 driver = webdriver.Chrome(service=service, options=options)
             except Exception as fallback_error:
-                logger.error("Failed to create Chrome WebDriver: %s", fallback_error)
-                raise RuntimeError(
-                    f"Could not initialize Chrome WebDriver: {fallback_error}"
-                ) from fallback_error
+                if self.settings.user_data_dir:
+                    logger.warning("Chrome crash detected. Retrying initialization without custom profile directory...")
+                    fallback_options = self.build_options(include_user_profile=False)
+                    try:
+                        driver = webdriver.Chrome(options=fallback_options)
+                    except Exception:
+                        service = Service(ChromeDriverManager().install())
+                        driver = webdriver.Chrome(service=service, options=fallback_options)
+                else:
+                    logger.error("Failed to create Chrome WebDriver: %s", fallback_error)
+                    raise RuntimeError(
+                        f"Could not initialize Chrome WebDriver: {fallback_error}"
+                    ) from fallback_error
 
         # Inject CDP command to override navigator.webdriver before document load
         try:
