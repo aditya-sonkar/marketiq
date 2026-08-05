@@ -1,7 +1,6 @@
 """Browser automation manager for handling Selenium WebDriver lifecycles."""
 
 import random
-from pathlib import Path
 from types import TracebackType
 from typing import Optional, Type
 from selenium import webdriver
@@ -22,13 +21,6 @@ class BrowserManager:
         settings (Settings): Configuration settings for driver options and timeouts.
         driver (Optional[webdriver.Chrome]): Active Selenium Chrome WebDriver instance.
     """
-
-    USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    ]
 
     WINDOW_SIZES = [
         "1366,768",
@@ -69,23 +61,23 @@ class BrowserManager:
         options.add_argument("--disable-background-networking")
         options.add_argument("--disable-features=TranslateUI")
         options.add_argument("--disable-features=VizDisplayCompositor")
+        options.add_argument("--remote-debugging-port=0")
 
         # Exclude automation flags to prevent detection
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
 
-        # Randomize window size and user-agent for natural browser fingerprint
+        # Randomize window size for natural browser fingerprint
         options.add_argument(f"--window-size={random.choice(self.WINDOW_SIZES)}")
-        options.add_argument(f"--user-agent={random.choice(self.USER_AGENTS)}")
 
-        # # Configure user data directory for persistent login state
-        # if self.settings.user_data_dir:
-        #     options.add_argument(f"--user-data-dir={self.settings.user_data_dir}")
+        # Configure user data directory for persistent login state
+        if self.settings.user_data_dir:
+            options.add_argument(f"--user-data-dir={self.settings.user_data_dir}")
 
-        #     if self.settings.profile_dir:
-        #         options.add_argument(
-        #             f"--profile-directory={self.settings.profile_dir}"
-        #         )
+            if self.settings.profile_dir:
+                options.add_argument(
+                    f"--profile-directory={self.settings.profile_dir}"
+                )
 
         options.page_load_strategy = "eager"
         return options
@@ -105,8 +97,9 @@ class BrowserManager:
 
         options = self.build_options()
         logger.info(
-            f"Initializing Chrome WebDriver (Headless: {self.settings.headless}, "
-            f"Timeout: {self.settings.page_load_timeout}s)..."
+            "Initializing Chrome WebDriver (Headless: %s, Timeout: %ss)...",
+            self.settings.headless,
+            self.settings.page_load_timeout,
         )
 
         try:
@@ -114,12 +107,12 @@ class BrowserManager:
             driver = webdriver.Chrome(options=options)
             
         except Exception as e:
-            logger.warning(f"Native Selenium Manager driver creation failed: {e}. Attempting ChromeDriverManager fallback...")
+            logger.warning("Native Selenium Manager driver creation failed: %s. Attempting ChromeDriverManager fallback...", e)
             try:
                 service = Service(ChromeDriverManager().install())
                 driver = webdriver.Chrome(service=service, options=options)
             except Exception as fallback_error:
-                logger.error(f"Failed to create Chrome WebDriver: {fallback_error}")
+                logger.error("Failed to create Chrome WebDriver: %s", fallback_error)
                 raise RuntimeError(
                     f"Could not initialize Chrome WebDriver: {fallback_error}"
                 ) from fallback_error
@@ -137,7 +130,7 @@ class BrowserManager:
                 },
             )
         except Exception as e:
-            logger.debug(f"Could not inject CDP webdriver override: {e}")
+            logger.debug("Could not inject CDP webdriver override: %s", e)
 
         # Configure driver timeouts
         driver.set_page_load_timeout(self.settings.page_load_timeout)
@@ -155,7 +148,7 @@ class BrowserManager:
             try:
                 self._driver.quit()
             except Exception as e:
-                logger.warning(f"Error encountered while quitting Chrome WebDriver: {e}")
+                logger.warning("Error encountered while quitting Chrome WebDriver: %s", e)
             finally:
                 self._driver = None
 

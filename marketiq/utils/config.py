@@ -52,6 +52,11 @@ class Settings:
     page_load_timeout: int = 30
     max_workers: int = 4
     max_retries: int = 3
+    no_progress_limit: int = 8
+    auth_timeout: int = 1800
+    screenshot_retention_days: int = 7
+    retry_base_delay: float = 2.0
+    retry_max_delay: float = 30.0
     min_scroll_pixels: int = 800
     max_scroll_pixels: int = 1400
     reading_pause_probability: float = 0.15
@@ -68,13 +73,10 @@ class Settings:
 
     def __post_init__(self) -> None:
         """Validate bounds and ensure target directories exist."""
-        # Convert path attributes to Path objects if passed as strings
-        if not isinstance(self.output_dir, Path):
-            self.output_dir = Path(self.output_dir)
-        if not isinstance(self.raw_data_dir, Path):
-            self.raw_data_dir = Path(self.raw_data_dir)
-        if not isinstance(self.processed_data_dir, Path):
-            self.processed_data_dir = Path(self.processed_data_dir)
+        # Convert path attributes to Path objects
+        self.output_dir = Path(self.output_dir)
+        self.raw_data_dir = Path(self.raw_data_dir)
+        self.processed_data_dir = Path(self.processed_data_dir)
 
         # Validate numeric bounds
         if self.max_tweets <= 0:
@@ -89,6 +91,8 @@ class Settings:
             raise ValueError(f"max_workers must be > 0, got {self.max_workers}")
         if self.max_retries <= 0:
             raise ValueError(f"max_retries must be > 0, got {self.max_retries}")
+        if self.no_progress_limit <= 0:
+            raise ValueError(f"no_progress_limit must be > 0, got {self.no_progress_limit}")
         if self.min_scroll_pixels <= 0:
             raise ValueError(f"min_scroll_pixels must be > 0, got {self.min_scroll_pixels}")
         if self.max_scroll_pixels < self.min_scroll_pixels:
@@ -97,12 +101,26 @@ class Settings:
             )
         if not (0.0 <= self.reading_pause_probability <= 1.0):
             raise ValueError(f"reading_pause_probability must be between 0.0 and 1.0, got {self.reading_pause_probability}")
+        if self.reading_pause_min < 0:
+            raise ValueError(f"reading_pause_min must be >= 0, got {self.reading_pause_min}")
+        if self.reading_pause_max < self.reading_pause_min:
+            raise ValueError(f"reading_pause_max ({self.reading_pause_max}) must be >= reading_pause_min ({self.reading_pause_min})")
+        if self.scroll_jitter_min < 0:
+            raise ValueError(f"scroll_jitter_min must be >= 0, got {self.scroll_jitter_min}")
+        if self.scroll_jitter_max < self.scroll_jitter_min:
+            raise ValueError(f"scroll_jitter_max ({self.scroll_jitter_max}) must be >= scroll_jitter_min ({self.scroll_jitter_min})")
 
-        # Bound max_workers based on available CPU core count
+        # Validate and standardize log level string
+        valid_log_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+        self.log_level = self.log_level.upper()
+        if self.log_level not in valid_log_levels:
+            raise ValueError(f"Invalid log_level: {self.log_level}. Must be one of {valid_log_levels}")
+
+        # Bound max_workers based on available system core count (I/O bound browsers)
         cpu_count = os.cpu_count() or 4
-        cpu_bound = cpu_count * 2
+        cpu_bound = max(cpu_count * 4, 4)
         if self.max_workers > cpu_bound:
-            logger.warning("Capping max_workers from %d to %d based on system CPU limits.", self.max_workers, cpu_bound)
+            logger.warning("Capping max_workers from %d to %d based on system limits.", self.max_workers, cpu_bound)
             self.max_workers = cpu_bound
 
         # Validate and normalize search hashtags
@@ -113,9 +131,8 @@ class Settings:
             for tag in self.search_hashtags
             if tag and isinstance(tag, str) and tag.strip()
         ]
-
-        # Standardize log level string
-        self.log_level = self.log_level.upper()
+        if not self.search_hashtags:
+            raise ValueError("At least one valid search hashtag must be provided.")
 
         # Ensure required data directories exist
         self._ensure_directories()
@@ -163,6 +180,11 @@ def load_settings_from_env() -> Settings:
         page_load_timeout=int(os.getenv("PAGE_LOAD_TIMEOUT", "30")),
         max_workers=int(os.getenv("MAX_WORKERS", "4")),
         max_retries=int(os.getenv("MAX_RETRIES", "3")),
+        no_progress_limit=int(os.getenv("NO_PROGRESS_LIMIT", "8")),
+        auth_timeout=int(os.getenv("AUTH_TIMEOUT", "1800")),
+        screenshot_retention_days=int(os.getenv("SCREENSHOT_RETENTION_DAYS", "7")),
+        retry_base_delay=float(os.getenv("RETRY_BASE_DELAY", "2.0")),
+        retry_max_delay=float(os.getenv("RETRY_MAX_DELAY", "30.0")),
         min_scroll_pixels=int(os.getenv("MIN_SCROLL_PIXELS", "800")),
         max_scroll_pixels=int(os.getenv("MAX_SCROLL_PIXELS", "1400")),
         reading_pause_probability=float(os.getenv("READING_PAUSE_PROBABILITY", "0.15")),

@@ -7,6 +7,7 @@ import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from enum import Enum, auto
 from pathlib import Path
 from threading import Lock
 from typing import Optional, Set, Tuple
@@ -29,8 +30,20 @@ from marketiq.utils.logger import get_logger
 
 logger = get_logger("scraper.twitter")
 
-# Precompiled regex for parsing metric numbers
+# Precompiled regular expressions for performance
 ENGAGEMENT_RE = re.compile(r"([\d,.]+\s*[kKmMbB]?)")
+HASHTAG_RE = re.compile(r"#(\w+)")
+MENTION_RE = re.compile(r"@(\w+)")
+STATUS_ID_RE = re.compile(r"/status/(\d+)")
+USERNAME_RE = re.compile(r"@([A-Za-z0-9_]{1,15})")
+
+
+class PageStatus(Enum):
+    """Enumeration of browser page states encountered during search navigation."""
+
+    OK = auto()
+    LOGIN_REQUIRED = auto()
+    RATE_LIMITED = auto()
 
 
 def parse_engagement_number(text: Optional[str]) -> int:
@@ -40,53 +53,46 @@ def parse_engagement_number(text: Optional[str]) -> int:
         text (Optional[str]): Metric text or aria-label snippet.
 
     Returns:
-        int: Parsed count value (>= 0).
+        int: Parsed integer value, or 0 if unparseable.
     """
     if not text:
         return 0
-
-    match = ENGAGEMENT_RE.search(text.replace(",", ""))
+    match = ENGAGEMENT_RE.search(text)
     if not match:
         return 0
 
-    token = match.group(1).strip().upper()
+    raw = match.group(1).replace(",", "").strip().lower()
     try:
-        if token.endswith("K"):
-            return int(float(token[:-1]) * 1_000)
-        elif token.endswith("M"):
-            return int(float(token[:-1]) * 1_000_000)
-        elif token.endswith("B"):
-            return int(float(token[:-1]) * 1_000_000_000)
-        return int(float(token))
+        if raw.endswith("k"):
+            return int(float(raw[:-1]) * 1_000)
+        if raw.endswith("m"):
+            return int(float(raw[:-1]) * 1_000_000)
+        if raw.endswith("b"):
+            return int(float(raw[:-1]) * 1_000_000_000)
+        return int(float(raw))
     except (ValueError, TypeError):
         return 0
 
 
-def cleanup_old_screenshots(logs_dir: Path = Path("logs"), days: int = 7) -> int:
-    """Remove debug PNG screenshots older than specified days.
+def cleanup_old_screenshots(days: Optional[int] = None) -> None:
+    """Clean up timestamped debug screenshot PNG files older than specified days in logs/.
 
     Args:
-        logs_dir (Path): Output logs directory.
-        days (int): Maximum age threshold in days.
-
-    Returns:
-        int: Number of deleted screenshot files.
+        days (Optional[int]): Maximum age threshold in days. Defaults to settings.screenshot_retention_days.
     """
+    retention_days = days if days is not None else default_settings.screenshot_retention_days
+    logs_dir = Path("logs")
     if not logs_dir.exists():
-        return 0
+        return
 
-    cutoff = time.time() - (days * 86400)
-    deleted_count = 0
-    for p in logs_dir.glob("*.png"):
+    cutoff = time.time() - (retention_days * 86400)
+    for screenshot in logs_dir.glob("*.png"):
         try:
-            if p.stat().st_mtime < cutoff:
-                p.unlink()
-                deleted_count += 1
+            if screenshot.stat().st_mtime < cutoff:
+                screenshot.unlink()
+                logger.debug("Cleaned up old screenshot: %s", screenshot.name)
         except Exception as e:
-            logger.debug("Failed deleting screenshot file %s: %s", p, e)
-    if deleted_count > 0:
-        logger.info("Cleaned up %d debug screenshot files older than %d days.", deleted_count, days)
-    return deleted_count
+            logger.debug("Failed to delete screenshot %s: %s", screenshot.name, e)
 
 
 class TwitterScraper:
@@ -94,7 +100,6 @@ class TwitterScraper:
 
     Attributes:
         settings (Settings): Configured setting bounds and timeouts.
-        browser_manager (BrowserManager): Driver manager instance.
         seen_tweet_hashes (Set[str]): SHA-256 hashes of seen tweets for deduplication.
         hash_lock (Lock): Thread safety lock for synchronizing seen_tweet_hashes updates.
         duplicate_count (int): Counter tracking number of duplicate tweets skipped.
@@ -109,46 +114,127 @@ class TwitterScraper:
     REPLY_LOCATOR = (By.CSS_SELECTOR, '[data-testid="reply"]')
     RETWEET_LOCATOR = (By.CSS_SELECTOR, '[data-testid="retweet"]')
     LIKE_LOCATOR = (By.CSS_SELECTOR, '[data-testid="like"]')
-    LOGIN_WALL_LOCATOR = (By.CSS_SELECTOR, '[data-testid="loginButton"], a[href="/login"]')
+    LOGIN_WALL_LOCATOR = (
+        By.CSS_SELECTOR,
+        '[data-testid="loginButton"], a[href*="/login"], a[href="/i/flow/login"], [data-testid="sheetDialog"]',
+    )
+    RATE_LIMIT_PHRASES = (
+        "rate limit exceeded",
+        "something went wrong",
+        "try again later",
+    )
 
     def __init__(
         self,
         settings: Optional[Settings] = None,
-        browser_manager: Optional[BrowserManager] = None,
     ) -> None:
         """Initialize TwitterScraper dependencies."""
         self.settings = settings or default_settings
-        self.browser_manager = browser_manager or BrowserManager(self.settings)
         self.seen_tweet_hashes: Set[str] = set()
         self.hash_lock = Lock()
         self.duplicate_count = 0
 
-    def check_for_login_wall(self, driver: WebDriver) -> bool:
-        """Detect whether X/Twitter is displaying a login wall, rate limit, or error banner overlay.
+    def _get_backoff_delay(self, attempt: int) -> float:
+        """Calculate config-driven exponential backoff delay with random jitter for retries."""
+        base = self.settings.retry_base_delay * (2 ** (attempt - 1))
+        delay = min(base, self.settings.retry_max_delay)
+        return delay + random.uniform(0.0, 1.0)
+
+    def check_page_status(self, driver: WebDriver) -> PageStatus:
+        """Detect whether X/Twitter page status is OK, LOGIN_REQUIRED, or RATE_LIMITED.
 
         Args:
             driver (WebDriver): Active browser driver.
 
         Returns:
-            bool: True if login wall or rate limit is present, False otherwise.
+            PageStatus: Status classification of the current browser state.
         """
         try:
-            elements = driver.find_elements(*self.LOGIN_WALL_LOCATOR)
-            if elements or "/login" in driver.current_url:
-                logger.warning("X/Twitter login wall detected.")
-                return True
+            current_url = (driver.current_url or "").lower()
+            if "/login" in current_url or "/i/flow/login" in current_url:
+                logger.warning("X/Twitter login URL detected: %s", driver.current_url)
+                return PageStatus.LOGIN_REQUIRED
 
-            body_text = (driver.execute_script("return (document.body ? document.body.innerText : '').toLowerCase();") or "")
-            if (
-                "rate limit exceeded" in body_text
-                or "something went wrong" in body_text
-                or "try again later" in body_text
-            ):
-                logger.warning("X/Twitter rate limit or error banner detected.")
-                return True
+            elements = driver.find_elements(*self.LOGIN_WALL_LOCATOR)
+            if elements:
+                logger.warning("X/Twitter login wall element detected.")
+                return PageStatus.LOGIN_REQUIRED
+
+            body_text = (
+                driver.execute_script("return (document.body ? document.body.innerText : '').toLowerCase();")
+                or ""
+            )
+            for phrase in self.RATE_LIMIT_PHRASES:
+                if phrase in body_text:
+                    logger.warning("X/Twitter rate limit or error banner detected: '%s'", phrase)
+                    return PageStatus.RATE_LIMITED
         except Exception as e:
-            logger.debug("Failed checking login wall locator: %s", e)
+            logger.debug("Failed checking page status: %s", e)
+        return PageStatus.OK
+
+    def is_authenticated(self, driver: WebDriver) -> bool:
+        """Check if active browser session is authenticated on X/Twitter using DOM elements.
+
+        Args:
+            driver (WebDriver): Active browser driver.
+
+        Returns:
+            bool: True if user session is authenticated, False if login wall is present.
+        """
+        try:
+            current_url = (driver.current_url or "").lower()
+            if "/login" in current_url or "/i/flow/login" in current_url:
+                return False
+
+            if driver.find_elements(*self.LOGIN_WALL_LOCATOR):
+                return False
+
+            authenticated_selectors = (
+                '[data-testid="AppTabBar_Home_Link"],'
+                '[data-testid="SideNav_AccountSwitcher_Button"],'
+                'article[data-testid="tweet"]'
+            )
+            return bool(driver.find_elements(By.CSS_SELECTOR, authenticated_selectors))
+        except Exception as e:
+            logger.debug("Error checking authentication status: %s", e)
         return False
+
+    def wait_for_authentication(self, driver: WebDriver, hashtag: str, timeout: Optional[int] = None) -> bool:
+        """Poll browser state using WebDriverWait until user completes authentication in Chrome.
+
+        Args:
+            driver (WebDriver): Active browser driver.
+            hashtag (str): Target hashtag query string.
+            timeout (Optional[int]): Maximum wait timeout in seconds. Defaults to self.settings.auth_timeout.
+
+        Returns:
+            bool: True once authenticated and ready to scrape, False if session fails or times out.
+        """
+        wait_timeout = timeout or self.settings.auth_timeout
+        logger.info("Login required. Waiting for user authentication (timeout: %ds)...", wait_timeout)
+        try:
+            wait = WebDriverWait(driver, wait_timeout, poll_frequency=2.5)
+            wait.until(lambda d: self.is_authenticated(d))
+            logger.info("Login detected. Continuing scraping...")
+
+            encoded_query = urllib.parse.quote(hashtag)
+            target_url = self.SEARCH_BASE_URL.format(query=encoded_query)
+            driver.get(target_url)
+
+            if self.check_page_status(driver) != PageStatus.OK:
+                logger.warning("[%s] Page status after login navigation is not OK.", hashtag)
+                return False
+
+            return True
+        except TimeoutException:
+            logger.error("[%s] Authentication wait timed out after %d seconds.", hashtag, wait_timeout)
+            return False
+        except WebDriverException as e:
+            logger.warning("WebDriver error while waiting for authentication: %s", e)
+            return False
+        except Exception as e:
+            logger.warning("Unexpected error during authentication wait: %s", e)
+            return False
 
     def save_debug_screenshot(self, driver: WebDriver, prefix: str, hashtag: str) -> None:
         """Save a timestamped screenshot of browser window for debugging.
@@ -169,7 +255,7 @@ class TwitterScraper:
             logger.debug("Failed to capture debug screenshot: %s", e)
 
     def search_hashtag(self, driver: WebDriver, hashtag: str, max_retries: Optional[int] = None) -> bool:
-        """Navigate to search query with automatic retry logic and login wall handling.
+        """Navigate to search query with automatic retry logic, login wall, and rate limit handling.
 
         Args:
             driver (WebDriver): Active Chrome driver instance.
@@ -188,9 +274,21 @@ class TwitterScraper:
             try:
                 driver.get(url)
 
-                if self.save_debug_screenshot(driver, "login_wall", hashtag):
-                    logger.warning("[%s] Login wall hit on attempt %d/%d. Retrying in 5s...", hashtag, attempt, retries)
-                    time.sleep(random.uniform(5.0, 10.0))
+                status = self.check_page_status(driver)
+                if status == PageStatus.LOGIN_REQUIRED or not self.is_authenticated(driver):
+                    self.save_debug_screenshot(driver, "login_wall", hashtag)
+                    if self.wait_for_authentication(driver, hashtag):
+                        wait = WebDriverWait(driver, self.settings.page_load_timeout)
+                        wait.until(EC.visibility_of_any_elements_located(self.TWEET_CONTAINER_LOCATOR))
+                        logger.info("[%s] Search page loaded successfully after authentication.", hashtag)
+                        return True
+                    else:
+                        logger.warning("[%s] Authentication wait failed on attempt %d/%d.", hashtag, attempt, retries)
+                        continue
+                elif status == PageStatus.RATE_LIMITED:
+                    self.save_debug_screenshot(driver, "rate_limit", hashtag)
+                    logger.warning("[%s] Rate limit detected on attempt %d/%d. Sleeping before retry...", hashtag, attempt, retries)
+                    time.sleep(random.uniform(10.0, 20.0))
                     continue
 
                 wait = WebDriverWait(driver, self.settings.page_load_timeout)
@@ -198,23 +296,49 @@ class TwitterScraper:
                 logger.info("[%s] Search page loaded successfully.", hashtag)
                 return True
             except TimeoutException:
+                if not self.is_authenticated(driver):
+                    logger.info("[%s] Page load timeout due to unauthenticated session. Triggering authentication wait...", hashtag)
+                    if self.wait_for_authentication(driver, hashtag):
+                        return True
                 logger.warning("[%s] Page load timeout on attempt %d/%d.", hashtag, attempt, retries)
                 self.save_debug_screenshot(driver, "timeout", hashtag)
             except WebDriverException as e:
                 logger.warning("[%s] WebDriver error on attempt %d/%d: %s", hashtag, attempt, retries, e)
                 self.save_debug_screenshot(driver, "error", hashtag)
 
-            time.sleep(random.uniform(2.5, 5.0))
+            backoff_delay = self._get_backoff_delay(attempt)
+            logger.debug("[%s] Backing off for %.2fs before retry attempt %d...", hashtag, backoff_delay, attempt + 1)
+            time.sleep(backoff_delay)
 
         logger.error("[%s] Failed to load search page after %d attempts.", hashtag, retries)
         return False
 
-    def extract_single_tweet(self, element: WebElement, cutoff_time: datetime) -> Optional[Tweet]:
+    def _safe_find_text(self, parent: WebElement, locator: Tuple[str, str]) -> str:
+        """Safely extract stripped text from a child element locator."""
+        try:
+            return parent.find_element(*locator).text.strip()
+        except Exception:
+            return ""
+
+    def _extract_status_id(self, element: WebElement) -> Optional[str]:
+        """Extract permanent Tweet numeric status ID from status link href."""
+        try:
+            link_elem = element.find_element(*self.STATUS_LINK_LOCATOR)
+            href = link_elem.get_attribute("href") or ""
+            match = STATUS_ID_RE.search(href)
+            return match.group(1) if match else None
+        except Exception:
+            return None
+
+    def extract_single_tweet(
+        self, element: WebElement, cutoff_time: datetime, status_id: Optional[str] = None
+    ) -> Optional[Tweet]:
         """Parse raw DOM element into a Tweet model with SHA-256 deduplication and 24-hour filtering.
 
         Args:
             element (WebElement): Tweet article DOM element.
             cutoff_time (datetime): Minimum allowed UTC creation timestamp.
+            status_id (Optional[str]): Pre-extracted permanent status ID if available.
 
         Returns:
             Optional[Tweet]: Parsed Tweet object, or None if skipped/invalid.
@@ -222,13 +346,11 @@ class TwitterScraper:
         try:
             # 1. Username
             username = "unknown"
-            try:
-                user_elem = element.find_element(*self.USER_NAME_LOCATOR)
-                match = re.search(r"@([A-Za-z0-9_]{1,15})", user_elem.text.strip())
+            user_text = self._safe_find_text(element, self.USER_NAME_LOCATOR)
+            if user_text:
+                match = USERNAME_RE.search(user_text)
                 if match:
                     username = match.group(1)
-            except Exception as e:
-                logger.debug("Could not extract username element: %s", e)
 
             # 2. Timestamp & 24-Hour Filter
             timestamp = datetime.now(timezone.utc)
@@ -245,27 +367,20 @@ class TwitterScraper:
                 return None
 
             # 3. Content Text
-            content = ""
-            try:
-                content_elem = element.find_element(*self.TWEET_TEXT_LOCATOR)
-                content = content_elem.text.strip()
-            except Exception as e:
-                logger.debug("Could not extract content element: %s", e)
+            content = self._safe_find_text(element, self.TWEET_TEXT_LOCATOR)
+            if not content:
+                try:
+                    full_text = element.text.strip()
+                    lines = [line.strip() for line in full_text.split("\n") if line.strip() and not line.startswith("@")]
+                    content = " ".join(lines)
+                except Exception:
+                    content = ""
 
             if not content and username == "unknown":
                 return None
 
             # 4. Immutable Tweet ID Extraction & SHA-256 Deduplication
-            tweet_id = None
-            try:
-                link_elem = element.find_element(*self.STATUS_LINK_LOCATOR)
-                href = link_elem.get_attribute("href") or ""
-                match = re.search(r"/status/(\d+)", href)
-                if match:
-                    tweet_id = match.group(1)
-            except Exception as e:
-                logger.debug("Could not extract tweet status link: %s", e)
-
+            tweet_id = status_id or self._extract_status_id(element)
             raw_hash_input = tweet_id if tweet_id else f"{username.lower()}:{timestamp.isoformat()}:{content}"
             sha256_hash = hashlib.sha256(raw_hash_input.encode("utf-8")).hexdigest()
 
@@ -276,14 +391,14 @@ class TwitterScraper:
                     return None
                 self.seen_tweet_hashes.add(sha256_hash)
 
-            # 5. Metrics
+            # 5. Engagement Metrics
             replies = self._extract_metric_count(element, self.REPLY_LOCATOR)
             reposts = self._extract_metric_count(element, self.RETWEET_LOCATOR)
             likes = self._extract_metric_count(element, self.LIKE_LOCATOR)
 
             # 6. Hashtags & Mentions
-            hashtags = re.findall(r"#(\w+)", content)
-            mentions = re.findall(r"@(\w+)", content)
+            hashtags = HASHTAG_RE.findall(content)
+            mentions = MENTION_RE.findall(content)
 
             return Tweet(
                 username=username,
@@ -311,16 +426,18 @@ class TwitterScraper:
                 return parse_engagement_number(text)
             aria_label = elem.get_attribute("aria-label")
             return parse_engagement_number(aria_label)
-        except Exception as e:
-            logger.debug("Failed extracting engagement metric: %s", e)
+        except Exception:
             return 0
 
-    def extract_visible_tweets(self, driver: WebDriver, cutoff_time: datetime) -> list[Tweet]:
-        """Scrape all currently visible tweet elements from the active browser tab.
+    def extract_visible_tweets(
+        self, driver: WebDriver, cutoff_time: datetime, seen_status_ids: set[str]
+    ) -> list[Tweet]:
+        """Scrape only newly rendered tweet elements using permanent status IDs, avoiding DOM re-processing.
 
         Args:
             driver (WebDriver): Active browser driver.
             cutoff_time (datetime): Minimum allowed UTC creation timestamp.
+            seen_status_ids (set[str]): Set of immutable status IDs already parsed in this session.
 
         Returns:
             list[Tweet]: Newly extracted Tweet instances.
@@ -330,41 +447,42 @@ class TwitterScraper:
         try:
             articles = driver.find_elements(*self.TWEET_CONTAINER_LOCATOR)
             for article in articles:
-                tweet = self.extract_single_tweet(article, cutoff_time)
+                status_id = self._extract_status_id(article)
+                if status_id and status_id in seen_status_ids:
+                    continue
+
+                tweet = self.extract_single_tweet(article, cutoff_time, status_id=status_id)
                 if tweet:
+                    if status_id:
+                        seen_status_ids.add(status_id)
                     extracted.append(tweet)
         except Exception as e:
             logger.warning("Error querying visible DOM tweets: %s", e)
 
         return extracted
 
-    def scroll(self, driver: WebDriver) -> Tuple[bool, int]:
-        """Execute human-like randomized smooth scroll action and return (success, current_scroll_y).
+    def scroll(self, driver: WebDriver) -> None:
+        """Execute human-like randomized scroll action.
 
         Args:
             driver (WebDriver): Active browser driver.
-
-        Returns:
-            Tuple[bool, int]: (Success flag, new document Y scroll offset).
         """
         try:
-            # Human-like random scroll distance with smooth behavior using configured pixel bounds
+            old_count = len(driver.find_elements(*self.TWEET_CONTAINER_LOCATOR))
             pixels = random.randint(self.settings.min_scroll_pixels, self.settings.max_scroll_pixels)
-            driver.execute_script("window.scrollBy({top: arguments[0], behavior: 'smooth'});", pixels)
+            driver.execute_script("window.scrollBy(0, arguments[0]);", pixels)
 
-            # Short settling pause for smooth scroll JS animation
-            time.sleep(0.2)
+            try:
+                wait = WebDriverWait(driver, 4.0)
+                wait.until(lambda d: len(d.find_elements(*self.TWEET_CONTAINER_LOCATOR)) > old_count)
+            except TimeoutException:
+                time.sleep(1.0)
 
-            # Occasional human reading pause
             if random.random() < self.settings.reading_pause_probability:
                 pause = random.uniform(self.settings.reading_pause_min, self.settings.reading_pause_max)
                 time.sleep(pause)
-
-            current_y = int(driver.execute_script("return window.scrollY || window.pageYOffset;"))
-            return True, current_y
         except Exception as e:
             logger.warning("Browser scroll failed: %s", e)
-            return False, 0
 
     def scrape_hashtag(self, hashtag: str, max_tweets: int) -> list[Tweet]:
         """Scrape tweets for a target hashtag using a dedicated managed browser context.
@@ -377,6 +495,7 @@ class TwitterScraper:
             list[Tweet]: Collected Tweet objects.
         """
         collected: list[Tweet] = []
+        # Dedicated BrowserManager per worker thread for thread-isolated Chrome contexts
         bm = BrowserManager(self.settings)
 
         try:
@@ -386,38 +505,52 @@ class TwitterScraper:
 
                 cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
                 scroll_count = 0
-                consecutive_pos_matches = 0
-                last_y = int(driver.execute_script("return window.scrollY || window.pageYOffset;"))
+                consecutive_no_growth = 0
+                seen_status_ids: set[str] = set()
 
                 while len(collected) < max_tweets and scroll_count < self.settings.max_scrolls:
-                    new_tweets = self.extract_visible_tweets(driver, cutoff_time)
+                    seen_count_before = len(seen_status_ids)
+                    new_tweets = self.extract_visible_tweets(driver, cutoff_time, seen_status_ids)
+                    added_count = 0
                     if new_tweets:
                         remaining = max_tweets - len(collected)
                         added_tweets = new_tweets[:remaining]
+                        added_count = len(added_tweets)
                         collected.extend(added_tweets)
                         logger.info(
                             "[%s] Progress: %d/%d tweets (+ %d new in scroll #%d)",
                             hashtag,
                             len(collected),
                             max_tweets,
-                            len(added_tweets),
+                            added_count,
                             scroll_count + 1,
                         )
 
-                    # Perform human-like smooth scroll down
-                    success, new_y = self.scroll(driver)
+                    self.scroll(driver)
                     scroll_count += 1
 
-                    if success and new_y == last_y:
-                        consecutive_pos_matches += 1
-                        if consecutive_pos_matches >= 5:
-                            logger.info("[%s] Reached bottom of feed (scroll Y position unchanged across 5 scrolls).", hashtag)
+                    if added_count == 0 and len(seen_status_ids) == seen_count_before:
+                        status = self.check_page_status(driver)
+                        if status == PageStatus.LOGIN_REQUIRED or not self.is_authenticated(driver):
+                            self.save_debug_screenshot(driver, "login_wall", hashtag)
+                            logger.info("[%s] Login required to continue scrolling. Waiting for user authentication...", hashtag)
+                            if not self.wait_for_authentication(driver, hashtag):
+                                logger.warning("[%s] Authentication wait failed or timed out.", hashtag)
+                                break
+                            consecutive_no_growth = 0
+                            continue
+
+                        consecutive_no_growth += 1
+                        if consecutive_no_growth >= self.settings.no_progress_limit:
+                            logger.info(
+                                "[%s] Reached bottom of feed (no new unique status IDs across %d scrolls).",
+                                hashtag,
+                                self.settings.no_progress_limit,
+                            )
                             break
                     else:
-                        consecutive_pos_matches = 0
-                        last_y = new_y
+                        consecutive_no_growth = 0
 
-                    # Config-driven randomized delay between scrolls with jitter bounds
                     sleep_duration = self.settings.scroll_delay + random.uniform(
                         self.settings.scroll_jitter_min, self.settings.scroll_jitter_max
                     )
@@ -437,8 +570,8 @@ class TwitterScraper:
         Returns:
             list[Tweet]: Consolidated list of extracted Tweet model objects.
         """
-        # Housekeeping: Clean old screenshots once at the start of the scraping run
-        cleanup_old_screenshots(days=7)
+        start_time = time.time()
+        cleanup_old_screenshots(days=self.settings.screenshot_retention_days)
 
         all_tweets: list[Tweet] = []
         hashtags = self.settings.search_hashtags
@@ -480,13 +613,20 @@ class TwitterScraper:
                 tweets = self.scrape_hashtag(hashtag, target_per_hashtag)
                 all_tweets.extend(tweets)
 
-        # Truncate to global max_tweets quota
         if len(all_tweets) > self.settings.max_tweets:
             all_tweets = all_tweets[: self.settings.max_tweets]
 
-        logger.info(
-            "Scraper pipeline execution complete. Total 24h tweets collected: %d (Duplicates removed: %d)",
-            len(all_tweets),
-            self.duplicate_count,
-        )
+        elapsed = time.time() - start_time
+        rate = len(all_tweets) / elapsed if elapsed > 0 else 0.0
+
+        logger.info("=========================================================")
+        logger.info("                SCRAPER EXECUTION SUMMARY                ")
+        logger.info("=========================================================")
+        logger.info("  Hashtags Target     : %s", hashtags)
+        logger.info("  Total Tweets Saved  : %d / %d", len(all_tweets), self.settings.max_tweets)
+        logger.info("  Duplicates Removed  : %d", self.duplicate_count)
+        logger.info("  Scraping Throughput : %.2f tweets/sec", rate)
+        logger.info("  Total Elapsed Time  : %.2fs", elapsed)
+        logger.info("=========================================================")
+
         return all_tweets
