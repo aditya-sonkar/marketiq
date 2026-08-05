@@ -99,11 +99,11 @@ cp .env.example .env
 
 | Tweets Over Time | Top Hashtags |
 |:---:|:---:|
-| ![Tweets Over Time](data/processed/plots/tweets_over_time.png) | ![Top Hashtags](data/processed/plots/top_hashtags.png) |
+| ![Tweets Over Time](assets/images/tweets_over_time.png) | ![Top Hashtags](assets/images/top_hashtags.png) |
 
 | Engagement Distribution | Signal Distribution |
 |:---:|:---:|
-| ![Engagement Distribution](data/processed/plots/engagement_distribution.png) | ![Signal Distribution](data/processed/plots/signal_distribution.png) |
+| ![Engagement Distribution](assets/images/engagement_distribution.png) | ![Signal Distribution](assets/images/signal_distribution.png) |
 
 ---
 
